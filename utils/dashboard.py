@@ -3,113 +3,147 @@ import plotly.express as px
 import pandas as pd
 
 
-def create_kpi_section(overall_df):
+# ---------------------------------------------------
+# KPI SECTION
+# ---------------------------------------------------
 
-    st.subheader("CRM Dashboard Summary")
+def create_kpi_section(df):
 
-    numeric_cols = overall_df.select_dtypes(include='number')
+    numeric_df = df.select_dtypes(include='number')
 
-    total_value = numeric_cols.sum().sum()
+    total_value = numeric_df.sum().sum()
 
     col1, col2 = st.columns(2)
 
     col1.metric(
         "Total Records",
-        len(overall_df)
+        len(df)
     )
 
     col2.metric(
-        "Overall Collection Value",
+        "Overall Value",
         f"₹ {round(total_value, 2):,.0f}"
     )
 
 
-def project_collection_chart(overall_df):
+# ---------------------------------------------------
+# PROJECT COLLECTION CHART
+# ---------------------------------------------------
 
-    st.subheader("Project Collection Analysis")
+def project_collection_chart(df):
 
-    numeric_cols = overall_df.select_dtypes(include='number')
+    numeric_df = df.select_dtypes(include='number')
 
-    if len(numeric_cols.columns) > 0:
+    chart_data = numeric_df.sum().reset_index()
 
-        chart_data = numeric_cols.sum().reset_index()
+    chart_data.columns = [
+        "Category",
+        "Value"
+    ]
 
-        chart_data.columns = [
-            "Category",
-            "Value"
-        ]
+    fig = px.bar(
+        chart_data,
+        x="Category",
+        y="Value",
+        title="Project Collection Analysis"
+    )
 
-        fig = px.bar(
-            chart_data,
-            x="Category",
-            y="Value"
-        )
-
-        st.plotly_chart(
-            fig,
-            width='stretch'
-        )
+    return fig
 
 
-def overdue_chart(overall_df):
+# ---------------------------------------------------
+# OVERDUE CHART
+# ---------------------------------------------------
 
-    st.subheader("Outstanding / Overdue Analysis")
+def overdue_chart(df):
 
-    numeric_cols = overall_df.select_dtypes(include='number')
+    numeric_df = df.select_dtypes(include='number')
 
-    if len(numeric_cols.columns) > 0:
+    fig = px.pie(
+        values=numeric_df.sum().values,
+        names=numeric_df.columns,
+        title="Outstanding Analysis"
+    )
 
-        fig = px.pie(
-            values=numeric_cols.sum().values,
-            names=numeric_cols.columns
-        )
-
-        st.plotly_chart(
-            fig,
-            width='stretch'
-        )
+    return fig
 
 
-def monthly_trend_chart(reports_df):
+# ---------------------------------------------------
+# DEMAND VS COLLECTION TREND
+# ---------------------------------------------------
 
-    st.subheader("Monthly Collection Trends")
+def demand_collection_trend(df):
 
-    numeric_cols = reports_df.select_dtypes(include='number')
+    numeric_df = df.select_dtypes(include='number')
 
-    if len(numeric_cols.columns) > 0:
+    trend_data = numeric_df.sum().reset_index()
 
-        trend_data = numeric_cols.sum().reset_index()
+    trend_data.columns = [
+        "Metric",
+        "Value"
+    ]
 
-        trend_data.columns = [
-            "Metric",
-            "Value"
-        ]
+    fig = px.line(
+        trend_data,
+        x="Metric",
+        y="Value",
+        markers=True,
+        title="Demand vs Collection Trend"
+    )
 
-        fig = px.line(
-            trend_data,
-            x="Metric",
-            y="Value"
-        )
+    return fig
 
-        st.plotly_chart(
-            fig,
-            width='stretch'
-        )
 
+# ---------------------------------------------------
+# TOP DEFAULTERS TABLE
+# ---------------------------------------------------
+
+def top_defaulters_table(df):
+
+    numeric_cols = df.select_dtypes(include='number').columns
+
+    if len(numeric_cols) == 0:
+        return pd.DataFrame()
+
+    df_copy = df.copy()
+
+    df_copy["Total Outstanding"] = (
+        df_copy[numeric_cols]
+        .sum(axis=1)
+    )
+
+    top_df = df_copy.sort_values(
+        by="Total Outstanding",
+        ascending=False
+    ).head(10)
+
+    return top_df
+
+
+# ---------------------------------------------------
+# AI QUESTION ANSWER
+# ---------------------------------------------------
 
 def ask_ai_question(question, overall_df, reports_df):
 
     question = question.lower()
 
     if "total collection" in question:
-        total = overall_df.select_dtypes(include='number').sum().sum()
-        return f"Total collection related numeric value is ₹ {round(total,2):,.0f}"
+
+        total = overall_df.select_dtypes(
+            include='number'
+        ).sum().sum()
+
+        return f"Total collection value is ₹ {round(total,2):,.0f}"
 
     elif "records" in question:
+
         return f"Total records available are {len(overall_df)}"
 
     elif "overdue" in question:
-        return "Overdue analysis is available in dashboard charts."
+
+        return "Overdue analysis available in dashboard charts."
 
     else:
-        return "AI assistant is active. Detailed project-specific intelligence can be enhanced further."
+
+        return "AI assistant active. More advanced CRM intelligence can be added."
