@@ -1,37 +1,72 @@
+"""
+utils/data_loader.py
+Loads the LATEST monthly Excel file from data/ automatically.
+No hardcoded filename — picks the most recent month found.
+
+File naming convention:
+    Overall Collection Summary - Mar 2026.xlsx
+    Overall Collection Summary - Apr 2026.xlsx
+    Overall Collection Summary - May 2026.xlsx
+    (add more months in same format — loader always picks the latest)
+"""
+
+import os
+import re
+import math
 import pandas as pd
 import streamlit as st
 
+DATA_DIR = "data"
 
-EXCEL_FILE = "data/Overall Collection Summary.xlsx"
+MONTH_NUM = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+    "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+    "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
-# ---------------------------------------------------------
-# SHEET NAMES (exact as in file)
-# ---------------------------------------------------------
-SHEET_OVERALL_DRAFT = "Overall_Draft"
-SHEET_REPORTING     = "Reporting"
+# ── File detection ─────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------
-# ROW / COLUMN CONSTANTS  (0-indexed, header=None)
-# ---------------------------------------------------------
-# Overall_Draft: project summary table
-OD_PROJ_HEADER_ROW = 2
-OD_PROJ_DATA_START = 3
-OD_PROJ_DATA_END   = 10   # row 10 = Total (inclusive)
-OD_PROJ_COL_START  = 11
-OD_PROJ_COL_END    = 23   # exclusive
+def get_latest_file() -> str | None:
+    """
+    Scan data/ for monthly files and return the path to the most recent one.
+    Pattern matched: 'Overall Collection Summary - Mon YYYY.xlsx'
+    """
+    pattern = re.compile(
+        r"Overall Collection Summary - ([A-Za-z]+) (\d{4})\.xlsx$",
+        re.IGNORECASE,
+    )
+    best_key  = -1
+    best_path = None
 
-# Overall_Draft: KPI labels / values
-OD_FORECAST_ROW    = 5    # col 1 => CRM Forecast
-OD_OUTSTANDING_ROW = 5    # col 3 => Outstanding
-OD_DAILY_COLL_ROW  = 5    # col 8 => Daily Collection
-OD_DATE_ROW        = 0    # col 8 => report date
+    for fname in os.listdir(DATA_DIR):
+        m = pattern.match(fname)
+        if not m:
+            continue
+        mon_str  = m.group(1).capitalize()[:3]
+        year_str = int(m.group(2))
+        mon_num  = MONTH_NUM.get(mon_str, 0)
+        sort_key = year_str * 100 + mon_num
+        if sort_key > best_key:
+            best_key  = sort_key
+            best_path = os.path.join(DATA_DIR, fname)
 
-# Reporting: clean project table (header row 0)
-RP_HEADER_ROW  = 0
-RP_DATA_START  = 1
-RP_DATA_END    = 8        # row 8 = Overall total (inclusive)
+    return best_path
 
-# Reporting column indices for project-level fields
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _safe_num(val, default=0.0):
+    try:
+        v = float(val)
+        return default if math.isnan(v) else v
+    except Exception:
+        return default
+
+
+# ── Column index constants (Reporting sheet, 0-indexed, header=None) ──────────
+
+RP_DATA_START     = 1
+RP_DATA_END       = 8    # row 8 = Overall total
 RP_PROJECT        = 1
 RP_TARGET         = 2
 RP_ACHIEVEMENT    = 3
@@ -50,7 +85,6 @@ RP_PEND_REG       = 15
 RP_PEND_REG_45    = 16
 RP_REG_TARGETS    = 17
 
-# Reporting: category breakdown (cols 20-52)
 RP_CAT_LABEL_COL  = 47
 RP_CAT_TARGET_COL = 48
 RP_CAT_ACH_COL    = 49
@@ -58,29 +92,43 @@ RP_CAT_ACH_PCT    = 50
 RP_CAT_FORECAST   = 51
 RP_CAT_BALANCE    = 52
 
+OD_DATE_ROW = 0
 
-# ---------------------------------------------------------
-# CACHING
-# ---------------------------------------------------------
 
-@st.cache_data(ttl=300)
-def load_excel_data(file_path: str = EXCEL_FILE):
+# ── Main loader ────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_excel_data(file_path: str | None = None):
     """
-    Load and parse the Overall Collection Summary Excel.
+    Load and parse the latest monthly Excel file.
+
+    Parameters
+    ----------
+    file_path : str | None
+        If None, auto-detects the latest monthly file in data/.
 
     Returns
     -------
-    project_df   : project-level CRM summary (7 projects + Total)
-    target_df    : monthly target vs achievement by project
-    category_df  : category-wise target breakdown
-    kpis         : dict of high-level KPI scalars
+    project_df  : pd.DataFrame  — project-level CRM summary
+    category_df : pd.DataFrame  — category-wise target breakdown
+    weekly_df   : pd.DataFrame  — weekly forecast
+    kpis        : dict          — high-level KPI scalars
     """
-    xl = pd.ExcelFile(file_path, engine="openpyxl")
+    # Auto-detect if no path supplied
+    if file_path is None or not os.path.exists(str(file_path)):
+        file_path = get_latest_file()
 
-    raw_od = xl.parse(SHEET_OVERALL_DRAFT, header=None)
-    raw_rp = xl.parse(SHEET_REPORTING,     header=None)
+    if file_path is None:
+        raise FileNotFoundError(
+            "No monthly Excel file found in data/.\n"
+            "Expected format: 'Overall Collection Summary - May 2026.xlsx'"
+        )
 
-    # ---- 1. Project Summary from Reporting sheet -------------------
+    xl     = pd.ExcelFile(file_path, engine="openpyxl")
+    raw_od = xl.parse("Overall_Draft", header=None)
+    raw_rp = xl.parse("Reporting",     header=None)
+
+    # ── 1. Project summary ────────────────────────────────────────────────────
     proj_headers = [
         "Project",
         "Collection Target (Cr)",
@@ -126,44 +174,39 @@ def load_excel_data(file_path: str = EXCEL_FILE):
 
     project_df = pd.DataFrame(proj_rows, columns=proj_headers)
 
-    # Separate projects vs total row
-    project_df_clean = project_df[
-        ~project_df["Project"].str.lower().isin(["overall", "total", "nan"])
-    ].copy().reset_index(drop=True)
+    # Separate project rows from totals row
+    is_total = project_df["Project"].str.lower().isin(["overall", "total", "nan", ""])
+    project_df_clean = project_df[~is_total].copy().reset_index(drop=True)
+    totals_row       = project_df[is_total]
+    totals           = totals_row.iloc[0] if len(totals_row) > 0 else None
 
-    totals_row = project_df[
-        project_df["Project"].str.lower().isin(["overall", "total"])
-    ]
-    totals = totals_row.iloc[0] if len(totals_row) > 0 else None
-
-    # ---- 2. Category-wise breakdown from Reporting ----------------
-    cat_labels = []
+    # ── 2. Category breakdown ─────────────────────────────────────────────────
+    cat_rows = []
     for i in range(RP_DATA_START, RP_DATA_END + 1):
         row = raw_rp.iloc[i]
         lbl = row.iloc[RP_CAT_LABEL_COL]
         if pd.notna(lbl) and str(lbl).strip():
-            cat_labels.append({
-                "Category": str(lbl).replace("\n", " ").strip(),
-                "Target (Cr)":      _safe_num(row.iloc[RP_CAT_TARGET_COL]),
-                "Achievement (Cr)": _safe_num(row.iloc[RP_CAT_ACH_COL]),
-                "Achievement %":    _safe_num(row.iloc[RP_CAT_ACH_PCT]),
-                "Forecast (Cr)":    _safe_num(row.iloc[RP_CAT_FORECAST]),
-                "Balance (Cr)":     _safe_num(row.iloc[RP_CAT_BALANCE]),
+            cat_rows.append({
+                "Category":        str(lbl).replace("\n", " ").strip(),
+                "Target (Cr)":     _safe_num(row.iloc[RP_CAT_TARGET_COL]),
+                "Achievement (Cr)":_safe_num(row.iloc[RP_CAT_ACH_COL]),
+                "Achievement %":   _safe_num(row.iloc[RP_CAT_ACH_PCT]),
+                "Forecast (Cr)":   _safe_num(row.iloc[RP_CAT_FORECAST]),
+                "Balance (Cr)":    _safe_num(row.iloc[RP_CAT_BALANCE]),
             })
-    category_df = pd.DataFrame(cat_labels)
+    category_df = pd.DataFrame(cat_rows)
 
-    # ---- 3. Weekly Forecast from Overall_Draft --------------------
-    od_wk_header_row = 52
-    od_wk_data_start = 53
-    od_wk_data_end   = 59
-    wk_projects = []
-    for c in range(12, 19):
-        v = raw_od.iloc[od_wk_header_row, c]
-        wk_projects.append(str(v).replace("\n", " ").strip() if pd.notna(v) else f"Col{c}")
-
+    # ── 3. Weekly forecast ────────────────────────────────────────────────────
+    wk_header_row = 52
+    wk_data_start = 53
+    wk_data_end   = 59
+    wk_projects   = [
+        str(raw_od.iloc[wk_header_row, c]).replace("\n", " ").strip()
+        for c in range(12, 19)
+    ]
     weekly_rows = []
-    for i in range(od_wk_data_start, od_wk_data_end + 1):
-        row = raw_od.iloc[i]
+    for i in range(wk_data_start, wk_data_end + 1):
+        row      = raw_od.iloc[i]
         week_lbl = str(row.iloc[11]).strip() if pd.notna(row.iloc[11]) else ""
         if not week_lbl:
             continue
@@ -173,37 +216,41 @@ def load_excel_data(file_path: str = EXCEL_FILE):
         weekly_rows.append(r)
     weekly_df = pd.DataFrame(weekly_rows)
 
-    # ---- 4. KPIs --------------------------------------------------
-    # Total rows
-    total_demand      = _safe_num(project_df_clean["Actual Demand Raised (Cr)"].sum())
-    total_collection  = _safe_num(project_df_clean["Collection Till Date (Cr)"].sum())
-    total_outstanding = _safe_num(project_df_clean["Outstanding (Cr)"].sum())
+    # ── 4. KPIs ───────────────────────────────────────────────────────────────
+    total_demand      = project_df_clean["Actual Demand Raised (Cr)"].sum()
+    total_collection  = project_df_clean["Collection Till Date (Cr)"].sum()
+    total_outstanding = project_df_clean["Outstanding (Cr)"].sum()
     total_pend_reg    = int(project_df_clean["Pending Registrations"].sum())
     total_pend_reg_45 = int(project_df_clean["Pending Reg > 45 Days"].sum())
     total_live_bkgs   = int(project_df_clean["Total Live Bookings"].sum())
-    monthly_coll      = _safe_num(project_df_clean["Monthly Collection (Cr)"].sum())
-    daily_coll        = _safe_num(project_df_clean["Daily Collection (Cr)"].sum())
+    monthly_coll      = project_df_clean["Monthly Collection (Cr)"].sum()
+    daily_coll        = project_df_clean["Daily Collection (Cr)"].sum()
 
-    # CRM Monthly Target vs Achievement from Overall_Draft row 2 col1
-    crm_summary_str = str(raw_od.iloc[2, 1]) if pd.notna(raw_od.iloc[2, 1]) else ""
-    # "₹ 10.99 / 38.72 (28.4%)" -> parse
-    crm_monthly_ach  = totals["Collection Achievement (Cr)"] if totals is not None else 0
-    crm_monthly_tgt  = totals["Collection Target (Cr)"]      if totals is not None else 0
-    collection_eff   = (crm_monthly_ach / crm_monthly_tgt * 100) if crm_monthly_tgt else 0
+    crm_monthly_ach = totals["Collection Achievement (Cr)"] if totals is not None else 0
+    crm_monthly_tgt = totals["Collection Target (Cr)"]      if totals is not None else 0
 
-    # Report date
     report_date = raw_od.iloc[OD_DATE_ROW, 8]
-    if hasattr(report_date, "strftime"):
-        report_date_str = report_date.strftime("%d %b %Y")
-    else:
-        report_date_str = str(report_date)
+    report_date_str = (
+        report_date.strftime("%d %b %Y")
+        if hasattr(report_date, "strftime")
+        else str(report_date)[:10]
+    )
+
+    # Derive month label from filename
+    fname    = os.path.basename(file_path)
+    m_match  = re.search(r"([A-Za-z]+)\s+(\d{4})", fname)
+    month_label = (
+        f"{m_match.group(1)[:3].capitalize()} {m_match.group(2)}"
+        if m_match else "Current"
+    )
 
     kpis = {
         "report_date":      report_date_str,
+        "month_label":      month_label,
+        "source_file":      fname,
         "total_demand":     total_demand,
         "total_collection": total_collection,
         "total_outstanding":total_outstanding,
-        "collection_eff":   collection_eff,
         "monthly_coll":     monthly_coll,
         "daily_coll":       daily_coll,
         "total_live_bkgs":  total_live_bkgs,
@@ -211,19 +258,8 @@ def load_excel_data(file_path: str = EXCEL_FILE):
         "pending_reg_45":   total_pend_reg_45,
         "crm_monthly_tgt":  crm_monthly_tgt,
         "crm_monthly_ach":  crm_monthly_ach,
+        "collection_eff":   round(total_collection / total_demand * 100, 2)
+                            if total_demand else 0.0,
     }
 
     return project_df_clean, category_df, weekly_df, kpis
-
-
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
-
-def _safe_num(val, default=0.0):
-    try:
-        v = float(val)
-        import math
-        return default if math.isnan(v) else v
-    except Exception:
-        return default
