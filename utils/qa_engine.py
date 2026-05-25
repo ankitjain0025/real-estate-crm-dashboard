@@ -1,14 +1,10 @@
 """
 utils/qa_engine.py
-Gemini AI Q&A engine — fixed for 429 quota errors.
+Gemini AI Q&A — fixed model list for 404 / 429 errors.
 
-Key fixes vs original:
-  - Uses google-generativeai SDK (not google-genai)
-  - Model priority list: gemini-1.5-flash → gemini-1.5-flash-8b → gemini-1.0-pro
-  - Compact context builder (avoids token quota exhaustion)
-  - Retry logic with backoff on 429 / 503
-  - Clear, actionable error messages shown to user
-  - Supports both single-month and multi-month context
+Root cause of 404: gemini-1.5-flash requires API version v1, not v1beta.
+google-generativeai SDK < 0.8 defaults to v1beta for some models.
+Fix: use model names that work on v1beta AND v1, with fallback chain.
 """
 
 import time
@@ -21,21 +17,24 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
+# Model priority — ordered by availability across free & paid keys
+# gemini-1.5-flash-latest  → resolves to latest stable, avoids version issues
+# gemini-1.5-pro-latest    → fallback
+# gemini-pro               → oldest, widest compatibility
 MODEL_PRIORITY = [
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-    "gemini-1.0-pro",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-pro-latest",
+    "gemini-pro",
 ]
+
 MAX_RETRIES  = 3
 RETRY_DELAYS = [5, 15, 30]
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
-
 def _get_api_key():
     try:
-        k = st.secrets["GEMINI_API_KEY"]
-        return k if k and str(k).strip() else None
+        k = st.secrets.get("GEMINI_API_KEY", "")
+        return k if k and str(k).strip() and k != "your-gemini-api-key-here" else None
     except Exception:
         return None
 
@@ -46,98 +45,99 @@ def _get_model():
     key = _get_api_key()
     if not key:
         return None, None
+
     genai.configure(api_key=key)
-    cfg = genai.types.GenerationConfig(temperature=0.05, max_output_tokens=800, top_p=0.9)
+    cfg = genai.types.GenerationConfig(
+        temperature=0.05,
+        max_output_tokens=800,
+        top_p=0.9,
+    )
     for name in MODEL_PRIORITY:
         try:
-            return genai.GenerativeModel(name, generation_config=cfg), name
+            model = genai.GenerativeModel(name, generation_config=cfg)
+            return model, name
         except Exception:
             continue
     return None, None
 
 
 def _build_context(project_df, category_df, kpis, mom_df=None, question=""):
-    """Build compact context — only include what the question needs."""
     q = question.lower()
     parts = []
 
-    # Portfolio KPIs always included
+    # Always include portfolio KPIs
     parts.append(
-        f"PORTFOLIO SNAPSHOT | Date: {kpis.get('report_date','—')}\n"
-        f"Demand: ₹{kpis.get('total_demand',0):.2f}Cr | "
-        f"Collection: ₹{kpis.get('total_collection',0):.2f}Cr | "
-        f"Outstanding: ₹{kpis.get('total_outstanding',0):.2f}Cr | "
-        f"Monthly: ₹{kpis.get('monthly_coll',0):.2f}Cr | "
-        f"Live Bookings: {int(kpis.get('total_live_bkgs',0))} | "
-        f"Pending Reg: {int(kpis.get('pending_reg',0))} | "
-        f"Pending>45d: {int(kpis.get('pending_reg_45',0))} | "
-        f"CRM Target: ₹{kpis.get('crm_monthly_tgt',0):.2f}Cr | "
-        f"CRM Achievement: ₹{kpis.get('crm_monthly_ach',0):.2f}Cr"
+        f"PORTFOLIO | Date:{kpis.get('report_date','—')} | Month:{kpis.get('month_label','—')}\n"
+        f"Demand:₹{kpis.get('total_demand',0):.2f}Cr | "
+        f"Collection:₹{kpis.get('total_collection',0):.2f}Cr | "
+        f"Outstanding:₹{kpis.get('total_outstanding',0):.2f}Cr | "
+        f"Efficiency:{kpis.get('collection_eff',0):.1f}% | "
+        f"MonthlyTarget:₹{kpis.get('crm_monthly_tgt',0):.2f}Cr | "
+        f"MonthlyAch:₹{kpis.get('crm_monthly_ach',0):.2f}Cr | "
+        f"PendingReg:{int(kpis.get('pending_reg',0))} | "
+        f"PendingReg>45d:{int(kpis.get('pending_reg_45',0))}"
     )
 
-    # Current month project table — always included
-    rows = []
-    for _, r in project_df.iterrows():
-        demand = r.get("Actual Demand Raised (Cr)", 0)
-        coll   = r.get("Collection Till Date (Cr)", 0)
-        eff    = round(coll / demand * 100, 1) if demand else 0
-        rows.append(
-            f"{r.get('Project','')} | "
-            f"Demand:₹{demand:.2f} | Collected:₹{coll:.2f} | "
-            f"Outstanding:₹{r.get('Outstanding (Cr)',0):.2f} | Eff:{eff}% | "
-            f"Target:₹{r.get('Collection Target (Cr)',0):.2f} | "
-            f"Ach:₹{r.get('Collection Achievement (Cr)',0):.2f}({r.get('Achievement %',0)*100:.1f}%) | "
-            f"PendReg:{int(r.get('Pending Registrations',0))} | "
-            f"Pend>45:{int(r.get('Pending Reg > 45 Days',0))}"
-        )
-    parts.append("CURRENT MONTH PROJECTS\n" + "\n".join(rows))
+    # Project table — always included
+    if not project_df.empty:
+        rows = []
+        for _, r in project_df.iterrows():
+            demand = r.get("Actual Demand Raised (Cr)", 0)
+            coll   = r.get("Collection Till Date (Cr)", 0)
+            eff    = round(coll / demand * 100, 1) if demand else 0
+            rows.append(
+                f"{r.get('Project','')} | "
+                f"Demand:₹{demand:.2f} | Collected:₹{coll:.2f} | "
+                f"Outstanding:₹{r.get('Outstanding (Cr)',0):.2f} | Eff:{eff}% | "
+                f"Target:₹{r.get('Collection Target (Cr)',0):.2f} | "
+                f"Ach:₹{r.get('Collection Achievement (Cr)',0):.2f} | "
+                f"AchPct:{r.get('Achievement %',0)*100:.1f}% | "
+                f"PendReg:{int(r.get('Pending Registrations',0))} | "
+                f"Pend>45:{int(r.get('Pending Reg > 45 Days',0))}"
+            )
+        parts.append("PROJECTS\n" + "\n".join(rows))
 
-    # Category breakdown — only when relevant
-    if any(k in q for k in ["category","ocr","slab","spill","segment","type"]):
+    # Category — only when relevant
+    if any(k in q for k in ["category","ocr","slab","spill","segment","type","booking"]):
         if not category_df.empty:
-            cat_rows = [
+            rows = [
                 f"{r.get('Category','')} | Target:₹{r.get('Target (Cr)',0):.2f} | "
-                f"Ach:₹{r.get('Achievement (Cr)',0):.2f} | {r.get('Achievement %',0)*100:.1f}%"
+                f"Ach:₹{r.get('Achievement (Cr)',0):.2f} | "
+                f"AchPct:{r.get('Achievement %',0)*100:.1f}%"
                 for _, r in category_df.iterrows()
             ]
-            parts.append("CATEGORY BREAKDOWN\n" + "\n".join(cat_rows))
+            parts.append("CATEGORIES\n" + "\n".join(rows))
 
-    # Multi-month data — only when trend/month question
+    # MoM — only when trend question
     if mom_df is not None and not mom_df.empty:
         if any(k in q for k in ["month","trend","mom","march","april","may","jan","feb",
                                   "history","compare","over time","improve","worsen",
-                                  "efficiency","target","forecast","outstanding"]):
-            # Summarise by month+project (compact)
-            keep = ["Month","Project","Monthly_Achievement_Cr","Achievement_Pct",
-                    "Forecast_Cr","Collection_Efficiency_Pct","Outstanding_Cr",
-                    "Pending_Reg"]
-            sub = mom_df[[c for c in keep if c in mom_df.columns]]
-            mom_lines = []
-            for _, r in sub.iterrows():
-                mom_lines.append(
-                    f"{r['Month']} | {r['Project']} | "
-                    f"Ach:₹{r.get('Monthly_Achievement_Cr',0):.2f}Cr({r.get('Achievement_Pct',0):.1f}%) | "
-                    f"Forecast:₹{r.get('Forecast_Cr',0):.2f} | "
-                    f"Eff:{r.get('Collection_Efficiency_Pct',0):.1f}% | "
-                    f"Outstanding:₹{r.get('Outstanding_Cr',0):.2f} | "
-                    f"PendReg:{int(r.get('Pending_Reg',0))}"
-                )
-            parts.append("MONTH-ON-MONTH DATA\n" + "\n".join(mom_lines))
+                                  "efficiency","outstanding","forecast"]):
+            keep = [c for c in ["Month","Project","Monthly_Achievement_Cr",
+                                 "Achievement_Pct","Forecast_Cr",
+                                 "Collection_Efficiency_Pct","Outstanding_Cr",
+                                 "Pending_Reg"] if c in mom_df.columns]
+            lines = [
+                " | ".join(f"{k}:{round(v,2) if isinstance(v,float) else v}"
+                           for k, v in zip(keep, row))
+                for row in mom_df[keep].values
+            ]
+            parts.append("MONTH-ON-MONTH\n" + "\n".join(lines))
 
     return "\n\n".join(parts)
 
 
 _SYSTEM = """You are a senior CRM analyst at RAGHAV Group, a Mumbai real estate developer.
-Answer ONLY using the data provided. Never invent numbers.
-If data is unavailable, say exactly: "This information is not available in the current report."
-Always include units (₹ Cr, %, count). Be concise — 3 to 8 lines.
-Collection Efficiency = Collection ÷ Demand × 100. All amounts in Indian Crores (1 Cr = ₹10 million).
+Answer ONLY from the data provided. Never invent figures.
+If data unavailable say: "This information is not available in the current report."
+Units: ₹ Cr, %, count. Be concise — 3 to 8 lines max.
+Collection Efficiency = Collection ÷ Demand × 100. All amounts in Indian Crores.
 
 DATA:
 {context}"""
 
 
-def _call_with_retry(model, prompt):
+def _call_with_retry(model, prompt, model_name):
     for attempt in range(MAX_RETRIES):
         try:
             return model.generate_content(prompt).text.strip()
@@ -153,6 +153,8 @@ def _call_with_retry(model, prompt):
                     time.sleep(RETRY_DELAYS[attempt])
                     continue
                 raise _ServiceError()
+            elif "404" in err or "not found" in err.lower():
+                raise _ModelNotFoundError(model_name)
             else:
                 raise e
     raise RuntimeError("Max retries exceeded")
@@ -160,15 +162,10 @@ def _call_with_retry(model, prompt):
 
 class _QuotaError(Exception): pass
 class _ServiceError(Exception): pass
+class _ModelNotFoundError(Exception): pass
 
-
-# ── Public API ─────────────────────────────────────────────────────────────────
 
 def ask_gemini(question, project_df, category_df, kpis, mom_df=None):
-    """
-    Main entry point called by app.py.
-    Returns a markdown-formatted string answer.
-    """
     if not question or not question.strip():
         return "Please type a question."
 
@@ -177,28 +174,46 @@ def ask_gemini(question, project_df, category_df, kpis, mom_df=None):
                 "Add `google-generativeai` to `requirements.txt` and redeploy.")
 
     if not _get_api_key():
-        return ("⚠️ **GEMINI_API_KEY not found in Streamlit secrets.**\n\n"
-                "Go to **Settings → Secrets** and add:\n```\nGEMINI_API_KEY = \"your-key\"\n```\n"
+        return ("⚠️ **GEMINI_API_KEY not configured.**\n\n"
+                "Go to Streamlit Cloud → **Settings → Secrets** and add:\n"
+                "```\nGEMINI_API_KEY = \"your-key-here\"\n```\n"
                 "Get a free key at https://aistudio.google.com/app/apikey")
 
     model, model_name = _get_model()
     if model is None:
-        return "⚠️ Could not initialise Gemini. Check your API key."
+        return "⚠️ Could not initialise any Gemini model. Check your API key."
 
     context = _build_context(project_df, category_df, kpis, mom_df, question)
     prompt  = _SYSTEM.format(context=context) + f"\n\nQuestion: {question.strip()}"
 
     try:
-        return _call_with_retry(model, prompt)
+        return _call_with_retry(model, prompt, model_name)
+
+    except _ModelNotFoundError as e:
+        # Try next model in list manually
+        genai.configure(api_key=_get_api_key())
+        cfg = genai.types.GenerationConfig(temperature=0.05, max_output_tokens=800)
+        for fallback_name in MODEL_PRIORITY:
+            if fallback_name == str(e):
+                continue
+            try:
+                fb_model = genai.GenerativeModel(fallback_name, generation_config=cfg)
+                return fb_model.generate_content(prompt).text.strip()
+            except Exception:
+                continue
+        return (
+            f"⚠️ **No Gemini model available** on your API key.\n\n"
+            f"Tried: {', '.join(MODEL_PRIORITY)}\n\n"
+            f"**Fix:** Enable billing at https://console.cloud.google.com/billing "
+            f"or generate a new key at https://aistudio.google.com/app/apikey\n\n"
+            f"**Data answer:**\n{_rule_answer(question, project_df, kpis)}"
+        )
 
     except _QuotaError:
         return (
-            "🚫 **Gemini quota exceeded.**\n\n"
-            "Your API key has hit its free-tier limit.\n\n"
-            "**Fix options:**\n"
-            "1. Enable billing at https://console.cloud.google.com/billing\n"
-            "2. Wait until midnight PT for the daily free quota to reset\n"
-            "3. Free tier: 15 req/min, ~1,500 req/day — a paid key removes limits\n\n"
+            "🚫 **Quota exceeded** — free tier limit hit.\n\n"
+            "Enable billing at https://console.cloud.google.com/billing "
+            "or wait until midnight PT for reset.\n\n"
             f"**Data answer:**\n{_rule_answer(question, project_df, kpis)}"
         )
 
@@ -216,23 +231,23 @@ def ask_gemini(question, project_df, category_df, kpis, mom_df=None):
 
 
 def _rule_answer(question, project_df, kpis):
-    """Deterministic fallback — answers directly from DataFrames."""
     q = question.lower()
     lines = []
 
-    if any(k in q for k in ["total","portfolio","overall","summary","kpi"]):
+    if any(k in q for k in ["total","portfolio","overall","summary"]):
         lines += [
             f"- Total Demand: ₹{kpis.get('total_demand',0):.2f} Cr",
             f"- Total Collection: ₹{kpis.get('total_collection',0):.2f} Cr",
-            f"- Total Outstanding: ₹{kpis.get('total_outstanding',0):.2f} Cr",
-            f"- Monthly Collection: ₹{kpis.get('monthly_coll',0):.2f} Cr",
+            f"- Outstanding: ₹{kpis.get('total_outstanding',0):.2f} Cr",
+            f"- Efficiency: {kpis.get('collection_eff',0):.1f}%",
+            f"- Monthly Target: ₹{kpis.get('crm_monthly_tgt',0):.2f} Cr",
+            f"- Monthly Achievement: ₹{kpis.get('crm_monthly_ach',0):.2f} Cr",
         ]
 
     if any(k in q for k in ["outstanding","defaulter","overdue"]):
         if not project_df.empty and "Outstanding (Cr)" in project_df.columns:
-            top = project_df.sort_values("Outstanding (Cr)", ascending=False)
             lines.append("\n**Projects by Outstanding:**")
-            for _, r in top.iterrows():
+            for _, r in project_df.sort_values("Outstanding (Cr)", ascending=False).iterrows():
                 lines.append(f"- {r['Project']}: ₹{r['Outstanding (Cr)']:.2f} Cr")
 
     if any(k in q for k in ["efficiency"]):
@@ -241,13 +256,25 @@ def _rule_answer(question, project_df, kpis):
             for _, r in project_df.iterrows():
                 d = r.get("Actual Demand Raised (Cr)", 0)
                 c = r.get("Collection Till Date (Cr)", 0)
-                eff = round(c/d*100, 1) if d else 0
-                lines.append(f"- {r['Project']}: {eff}%")
+                lines.append(f"- {r['Project']}: {round(c/d*100,1) if d else 0}%")
 
     if any(k in q for k in ["pending","registration"]):
         if not project_df.empty and "Pending Registrations" in project_df.columns:
             lines.append("\n**Pending Registrations:**")
             for _, r in project_df.sort_values("Pending Registrations", ascending=False).iterrows():
-                lines.append(f"- {r['Project']}: {int(r['Pending Registrations'])} ({int(r.get('Pending Reg > 45 Days',0))} > 45 days)")
+                lines.append(
+                    f"- {r['Project']}: {int(r['Pending Registrations'])} "
+                    f"({int(r.get('Pending Reg > 45 Days',0))} > 45 days)"
+                )
 
-    return "\n".join(lines) if lines else "Please check the dashboard charts above for details."
+    if any(k in q for k in ["target","achieve","forecast"]):
+        if not project_df.empty and "Collection Target (Cr)" in project_df.columns:
+            lines.append("\n**Target vs Achievement:**")
+            for _, r in project_df.iterrows():
+                lines.append(
+                    f"- {r['Project']}: Target ₹{r.get('Collection Target (Cr)',0):.2f} | "
+                    f"Achieved ₹{r.get('Collection Achievement (Cr)',0):.2f} | "
+                    f"{r.get('Achievement %',0)*100:.1f}%"
+                )
+
+    return "\n".join(lines) if lines else "Please refer to the dashboard charts above."
