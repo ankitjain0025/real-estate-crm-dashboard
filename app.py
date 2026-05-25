@@ -211,6 +211,8 @@ with tab1:
             "Collection Target (Cr)":      "₹ {:.2f} Cr",
             "Collection Achievement (Cr)": "₹ {:.2f} Cr",
             "Achievement %":               "{:.1f}%",
+            "Pending Registrations":    "{:.0f}",
+            "Pending Reg > 45 Days":   "{:.0f}",
         }), use_container_width=True)
 
     st.download_button("⬇️ Download CRM Data CSV",
