@@ -19,6 +19,9 @@ def _safe(val, default=0.0):
     except: return default
 
 def _normalise(name: str) -> str:
+    """Collapse newlines + multiple spaces, then map to canonical name."""
+    import re as _re
+    cleaned = _re.sub(r'\s+', ' ', str(name).replace('\n', ' ')).strip()
     mapping = {
         "raghav paradise": "RAGHAV Paradise",
         "raghav parijat":  "RAGHAV Parijat",
@@ -29,7 +32,7 @@ def _normalise(name: str) -> str:
         "raghav utopia":   "RAGHAV Utopia",
         "raghav enclave":  "RAGHAV Enclave",
     }
-    return mapping.get(name.lower().strip(), name.strip())
+    return mapping.get(cleaned.lower(), cleaned)
 
 def _detect_files():
     pat = re.compile(r"Overall Collection Summary - ([A-Za-z]+) (\d{4})\.xlsx$", re.I)
@@ -55,7 +58,7 @@ def _parse_file(path, label):
     rows = []
     for i in range(1, 8):
         r    = rp.iloc[i]
-        proj = _normalise(str(r.iloc[1]).replace("\n"," ").strip())
+        proj = _normalise(str(r.iloc[1]))
         if not proj or proj.lower() in ["nan","overall",""]: continue
         demand = _safe(r.iloc[12])
         coll   = _safe(r.iloc[13])
