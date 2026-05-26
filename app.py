@@ -120,8 +120,11 @@ fkpis.update({
 })
 
 fmom = pd.DataFrame(); fport = pd.DataFrame()
-if not mom_df.empty and sel_months:
-    fmom  = mom_df[mom_df["Project"].isin(sel_projects) & mom_df["Month"].isin(sel_months)].copy()
+# If sidebar multiselect returns empty (first render), default to all months
+if not mom_df.empty:
+    _months_to_use = sel_months if sel_months else mom_df["Month"].unique().tolist()
+    _projs_to_use  = sel_projects if sel_projects else mom_df["Project"].unique().tolist()
+    fmom  = mom_df[mom_df["Project"].isin(_projs_to_use) & mom_df["Month"].isin(_months_to_use)].copy()
     fport = get_portfolio_monthly(fmom)
 
 if not mom_df.empty:
